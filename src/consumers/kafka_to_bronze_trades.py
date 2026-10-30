@@ -62,6 +62,7 @@ def main():
     print(f"[bronze] writing under {base_dir.resolve()}")
 
     part_idx = 1
+    last_written_message = None
     current_bucket: Optional[Path] = None
     f = None
     msg_count = 0
@@ -95,6 +96,7 @@ def main():
 
             # write message line
             f.write(safe_json_bytes(msg.value()))
+            last_written_message = msg
             msg_count += 1
 
             # flush & commit periodically (reliability)
@@ -102,13 +104,13 @@ def main():
             if msg_count % 200 == 0:
                 f.flush()
                 os.fsync(f.fileno())
-                consumer.commit(asynchronous=False)
+                consumer.commit(message=last_written_message, asynchronous=False)
 
             # roll file conditions
             if msg_count >= max_msgs_per_file or (time.time() - file_opened_at) >= max_seconds_per_file:
                 f.flush()
                 os.fsync(f.fileno())
-                consumer.commit(asynchronous=False)
+                consumer.commit(message=last_written_message, asynchronous=False)
                 f.close()
                 f = None  # force reopen new part next message
 
@@ -120,7 +122,7 @@ def main():
                 f.flush()
                 os.fsync(f.fileno())
                 f.close()
-                consumer.commit(asynchronous=False)
+                consumer.commit(message=last_written_message, asynchronous=False)
         finally:
             consumer.close()
             print("[bronze] closed")
