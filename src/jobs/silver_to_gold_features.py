@@ -1,94 +1,106 @@
-import glob
+"""Build per-minute financial features from Silver trades."""
+
+import os
 from pathlib import Path
+
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 
 
-def floor_to_minute(ts: pd.Series) -> pd.Series:
-    return ts.dt.floor("min")
-
-
 def main():
-    load_dotenv(dotenv_path=".env")
+    load_dotenv()
 
-    silver_root = Path("data/silver/trades")
-    gold_root = Path("data/gold/features_trades")
+    silver = Path(os.getenv("SILVER_BASE_DIR", "data/silver")) / "trades"
+    gold = Path("data/gold/features_trades")
 
-    # Read the whole dataset so partition columns (dt, symbol) are included
-    df = pd.read_parquet(str(silver_root), engine="pyarrow")
+    df = pd.read_parquet(silver)
+    if df.empty:
+        raise SystemExit("Silver contains no trades.")
 
-    # Ensure required columns exist
-    required = ["symbol", "price", "size", "trade_ts"]
-    missing = [c for c in required if c not in df.columns]
+    required = {"symbol", "price", "size", "trade_ts", "event_id"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"[gold] missing required columns: {missing}. Columns present: {list(df.columns)}")
+        raise ValueError(f"Missing columns: {sorted(missing)}")
 
-    # Ensure types
-    df["trade_ts"] = pd.to_datetime(df["trade_ts"], utc=True, errors="coerce")
-    df["minute_ts"] = floor_to_minute(df["trade_ts"])
-    df["dt"] = df["minute_ts"].dt.date.astype("string")
+    if df["event_id"].duplicated().any():
+        raise ValueError("Duplicate Silver event IDs detected.")
 
-    # Base per-minute aggregates
-    # VWAP = sum(price * size) / sum(size)
-    g = df.groupby(["dt", "symbol", "minute_ts"], as_index=False).agg(
-        vwap_num=("price", lambda x: 0.0),  # placeholder (we’ll compute below)
+    df["symbol"] = df["symbol"].astype("string")
+    df["trade_ts"] = pd.to_datetime(df["trade_ts"], utc=True)
+    df = df.sort_values(["symbol", "trade_ts", "event_id"])
+
+    df["minute_ts"] = df["trade_ts"].dt.floor("min")
+    df["dt"] = df["minute_ts"].dt.strftime("%Y-%m-%d")
+    df["price_times_size"] = df["price"] * df["size"]
+
+    keys = ["dt", "symbol", "minute_ts"]
+
+    out = df.groupby(keys, observed=True, as_index=False).agg(
+        weighted_value=("price_times_size", "sum"),
         volume=("size", "sum"),
         trade_count=("event_id", "count"),
         price_last=("price", "last"),
     )
 
-    # Compute VWAP properly using price*size
-    df["px_sz"] = df["price"] * df["size"].astype(float)
-    vwap = df.groupby(["dt", "symbol", "minute_ts"], as_index=False).agg(
-        vwap_num=("px_sz", "sum"),
-        vwap_den=("size", "sum"),
-    )
-    vwap["vwap"] = vwap["vwap_num"] / vwap["vwap_den"].replace({0: pd.NA})
+    if out["volume"].le(0).any():
+        raise ValueError("Nonpositive minute volume detected.")
 
-    # Merge aggregates
-    out = g.drop(columns=["vwap_num"]).merge(
-        vwap[["dt", "symbol", "minute_ts", "vwap"]],
-        on=["dt", "symbol", "minute_ts"],
-        how="left",
-    )
-
-    # Sort for time-series features
+    out["vwap"] = out["weighted_value"] / out["volume"]
     out = out.sort_values(["symbol", "minute_ts"]).reset_index(drop=True)
 
-    # Returns: pct change in vwap (fallback to last price if vwap missing)
-    base_price = out["vwap"].fillna(out["price_last"])
-    out["return_1m"] = base_price.groupby(out["symbol"]).pct_change()
+    # Reset features at each UTC date boundary.
+    groups = out.groupby(["symbol", "dt"], observed=True)
 
-    # Rolling volatility (5 minutes) on return_1m
-    out["vol_5m"] = (
-        out.groupby("symbol")["return_1m"]
-        .rolling(window=5, min_periods=3)
-        .std()
-        .reset_index(level=0, drop=True)
+    previous_price = groups["vwap"].shift(1)
+    previous_minute = groups["minute_ts"].shift(1)
+
+    # Only calculate a one-minute return for adjacent minutes.
+    adjacent = (
+        out["minute_ts"] - previous_minute
+    ).eq(pd.Timedelta(minutes=1))
+
+    out["return_1m"] = (
+        out["vwap"] / previous_price - 1
+    ).where(adjacent)
+
+    # Five consecutive one-minute returns are required.
+    # A missing minute makes its return null, breaking the window.
+    out["vol_5m"] = out.groupby(
+        ["symbol", "dt"], observed=True
+    )["return_1m"].transform(
+        lambda series: series.rolling(
+            window=5, min_periods=5
+        ).std(ddof=1)
     )
 
-    # Clean up final columns
-    out = out[[
+    # Reconcile Gold totals to Silver before writing.
+    assert int(out["trade_count"].sum()) == len(df)
+    assert int(out["volume"].sum()) == int(df["size"].sum())
+    assert not out.duplicated(["symbol", "minute_ts"]).any()
+
+    columns = [
         "dt", "symbol", "minute_ts",
         "vwap", "price_last", "volume", "trade_count",
-        "return_1m", "vol_5m"
-    ]]
+        "return_1m", "vol_5m",
+    ]
+    out = out[columns]
 
-    gold_root.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pandas(out, preserve_index=False)
-
+    gold.mkdir(parents=True, exist_ok=True)
     pq.write_to_dataset(
-        table,
-        root_path=str(gold_root),
+        pa.Table.from_pandas(out, preserve_index=False),
+        root_path=str(gold),
         partition_cols=["dt", "symbol"],
-        existing_data_behavior="overwrite_or_ignore",
+        basename_template="part-{i}.parquet",
+        existing_data_behavior="delete_matching",
     )
 
-    print(f"[gold] wrote features dataset -> {gold_root.resolve()}")
-    print("[gold] sample:")
-    print(out.head(10))
+    print(f"Silver trades: {len(df):,}")
+    print(f"Gold minute rows: {len(out):,}")
+    print(f"Reconciled trade count: {out['trade_count'].sum():,}")
+    print("Volume reconciliation: PASS")
+    print(out.head(8).to_string(index=False))
 
 
 if __name__ == "__main__":

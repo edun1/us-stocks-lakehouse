@@ -33,3 +33,9 @@ data/quarantine/
 
 # Docker
 docker-data/
+
+.venv/
+.env
+__pycache__/
+*.pyc
+data/

@@ -1,61 +1,81 @@
+"""Load the Gold snapshot into PostgreSQL."""
+
 import os
+
 import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
-TABLE = "features_trades"
 
 def main():
     load_dotenv(dotenv_path=".env")
 
-    user = os.getenv("POSTGRES_USER", "postgres")
-    pw = os.getenv("POSTGRES_PASSWORD", "postgres")
-    db = os.getenv("POSTGRES_DB", "stocks")
-    conn_str = f"postgresql://{user}:{pw}@localhost:5432/{db}"
+    columns = [
+        "dt", "symbol", "minute_ts",
+        "vwap", "price_last", "volume", "trade_count",
+        "return_1m", "vol_5m",
+    ]
 
-    df = pd.read_parquet("data/gold/features_trades", engine="pyarrow")
+    df = pd.read_parquet("data/gold/features_trades")
+    df = df[columns].copy()
 
-    # Ensure expected columns exist
-    cols = ["dt","symbol","minute_ts","vwap","price_last","volume","trade_count","return_1m","vol_5m"]
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"[pg] missing columns: {missing}. Present: {list(df.columns)}")
+    if df.empty:
+        raise ValueError("Gold is empty; existing database data was preserved.")
 
-    # Types + NULL handling
-    df["minute_ts"] = pd.to_datetime(df["minute_ts"], utc=True, errors="coerce")
+    if df.duplicated(["symbol", "minute_ts"]).any():
+        raise ValueError("Duplicate symbol/minute pairs found in Gold.")
 
-    # Force everything to plain Python objects, then replace missing with None
-    df = df.astype(object)
-    df = df.where(pd.notna(df), None)
+    df["minute_ts"] = pd.to_datetime(df["minute_ts"], utc=True)
 
-    print(f"[pg] rows to load: {len(df)}")
+    # Convert missing feature values to SQL NULL.
+    df = df.astype(object).where(pd.notna(df), None)
+    rows = list(df.itertuples(index=False, name=None))
 
-    with psycopg.connect(conn_str) as conn:
+    print(f"[pg] rows to load: {len(rows)}")
+
+    with psycopg.connect(
+        host="localhost",
+        port=5432,
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        dbname=os.environ["POSTGRES_DB"],
+    ) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE} (
-              dt date,
-              symbol text,
-              minute_ts timestamptz,
-              vwap double precision,
-              price_last double precision,
-              volume bigint,
-              trade_count bigint,
-              return_1m double precision,
-              vol_5m double precision
-            );
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS features_trades (
+                    dt date,
+                    symbol text,
+                    minute_ts timestamptz,
+                    vwap double precision,
+                    price_last double precision,
+                    volume bigint,
+                    trade_count bigint,
+                    return_1m double precision,
+                    vol_5m double precision
+                )
             """)
-            cur.execute(f"TRUNCATE TABLE {TABLE};")
 
-            insert_sql = f"""
-            INSERT INTO {TABLE} ({",".join(cols)})
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-            cur.executemany(insert_sql, [tuple(r) for r in df[cols].itertuples(index=False, name=None)])
-        conn.commit()
+            # Replace this demo snapshot within one transaction.
+            cur.execute("TRUNCATE TABLE features_trades")
 
-    print(f"[pg] loaded table: {TABLE}")
+            cur.executemany("""
+                INSERT INTO features_trades (
+                    dt, symbol, minute_ts,
+                    vwap, price_last, volume, trade_count,
+                    return_1m, vol_5m
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, rows)
+
+            cur.execute("SELECT COUNT(*) FROM features_trades")
+            stored = cur.fetchone()[0]
+
+            if stored != len(rows):
+                raise ValueError("Database row-count reconciliation failed.")
+
+    print(f"[pg] loaded table: features_trades ({stored} rows)")
     print("[pg] done")
+
 
 if __name__ == "__main__":
     main()
