@@ -30,7 +30,7 @@ Silver and Gold processing run as batch jobs after ingestion.
 - Required five consecutive returns for rolling volatility.
 - Passed PostgreSQL credentials as separate connection parameters.
 - Added an explicit last-message offset to consumer commit calls.
-  This shutdown change still needs a runtime retest.
+  A Kafka replay followed by Ctrl+C shutdown completed without errors.
 
 ## Run the tests
 
